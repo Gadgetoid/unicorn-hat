@@ -55,9 +55,10 @@
 
 #define OSC_FREQ                                 19200000   // crystal frequency
 
-/* 3 colors, 8 bits per byte, 3 symbols per bit + 55uS low for reset signal */
+/* 4 colors (R, G, B + W), 8 bits per byte, 3 symbols per bit + 55uS low for reset signal */
+#define LED_COLOURS                              4
 #define LED_RESET_uS                             55
-#define LED_BIT_COUNT(leds, freq)                ((leds * 3 * 8 * 3) + ((LED_RESET_uS * \
+#define LED_BIT_COUNT(leds, freq)                ((leds * LED_COLOURS * 8 * 3) + ((LED_RESET_uS * \
                                                   (freq * 3)) / 1000000))
 
 // Pad out to the nearest uint32 + 32-bits for idle low/high times the number of channels
@@ -66,8 +67,6 @@
 
 #define SYMBOL_HIGH                              0x6  // 1 1 0
 #define SYMBOL_LOW                               0x4  // 1 0 0
-
-#define ARRAY_SIZE(stuff)                        (sizeof(stuff) / sizeof(stuff[0]))
 
 
 // We use the mailbox interface to request memory from the VideoCore.
@@ -336,7 +335,7 @@ static void dma_start(ws2811_t *ws2811)
     dma->conblk_ad = dma_cb_addr;
     dma->debug = 7; // clear debug error flags
     dma->cs = RPI_DMA_CS_WAIT_OUTSTANDING_WRITES |
-              RPI_DMA_CS_PANIC_PRIORITY(15) | 
+              RPI_DMA_CS_PANIC_PRIORITY(15) |
               RPI_DMA_CS_PRIORITY(15) |
               RPI_DMA_CS_ACTIVE;
 }
@@ -461,18 +460,19 @@ int ws2811_init(ws2811_t *ws2811)
     ws2811_device_t *device;
     const rpi_hw_t *rpi_hw;
     int chan;
+    int error = -1;
 
     ws2811->rpi_hw = rpi_hw_detect();
     if (!ws2811->rpi_hw)
     {
-        return -1;
+        return WS2811_ERR_HW_DETECT;
     }
     rpi_hw = ws2811->rpi_hw;
 
     ws2811->device = malloc(sizeof(*ws2811->device));
     if (!ws2811->device)
     {
-        return -1;
+        return WS2811_ERR_DEVICE_MALLOC;
     }
     device = ws2811->device;
 
@@ -485,23 +485,31 @@ int ws2811_init(ws2811_t *ws2811)
     device->mbox.handle = mbox_open();
     if (device->mbox.handle == -1)
     {
-        return -1;
+        return WS2811_ERR_MAILBOX_OPEN;
     }
 
     device->mbox.mem_ref = mem_alloc(device->mbox.handle, device->mbox.size, PAGE_SIZE,
                                      rpi_hw->videocore_base == 0x40000000 ? 0xC : 0x4);
     if (device->mbox.mem_ref == 0)
     {
-       return -1;
+       return WS2811_ERR_MAILBOX_ALLOC;
     }
 
     device->mbox.bus_addr = mem_lock(device->mbox.handle, device->mbox.mem_ref);
     if (device->mbox.bus_addr == (uint32_t) ~0UL)
     {
        mem_free(device->mbox.handle, device->mbox.size);
-       return -1;
+       return WS2811_ERR_MAILBOX_LOCK;
     }
+
     device->mbox.virt_addr = mapmem(BUS_TO_PHYS(device->mbox.bus_addr), device->mbox.size);
+    if (!device->mbox.virt_addr)
+    {
+        mem_unlock(device->mbox.handle, device->mbox.mem_ref);
+        mem_free(device->mbox.handle, device->mbox.size);
+        error = WS2811_ERR_MAP_MEM;
+        goto err;
+    }
 
     // Initialize all pointers to NULL.  Any non-NULL pointers will be freed on cleanup.
     device->pwm_raw = NULL;
@@ -519,6 +527,7 @@ int ws2811_init(ws2811_t *ws2811)
         channel->leds = malloc(sizeof(ws2811_led_t) * channel->count);
         if (!channel->leds)
         {
+            error = WS2811_ERR_LEDS_MALLOC;
             goto err;
         }
 
@@ -543,6 +552,7 @@ int ws2811_init(ws2811_t *ws2811)
     // Map the physical registers into userspace
     if (map_registers(ws2811))
     {
+        error = WS2811_ERR_MAP_REGISTERS;
         goto err;
     }
 
@@ -550,6 +560,7 @@ int ws2811_init(ws2811_t *ws2811)
     if (gpio_init(ws2811))
     {
         unmap_registers(ws2811);
+        error = WS2811_ERR_GPIO_INIT;
         goto err;
     }
 
@@ -557,6 +568,7 @@ int ws2811_init(ws2811_t *ws2811)
     if (setup_pwm(ws2811))
     {
         unmap_registers(ws2811);
+        error = WS2811_ERR_SETUP_PWM;
         goto err;
     }
 
@@ -565,7 +577,7 @@ int ws2811_init(ws2811_t *ws2811)
 err:
     ws2811_cleanup(ws2811);
 
-    return -1;
+    return error;
 }
 
 /**
@@ -631,6 +643,7 @@ int ws2811_render(ws2811_t *ws2811)
         ws2811_channel_t *channel = &ws2811->channel[chan];
         int wordpos = chan;
         int scale   = (channel->brightness & 0xff) + 1;
+        int wshift  = (channel->strip_type >> 24) & 0xff;
         int rshift  = (channel->strip_type >> 16) & 0xff;
         int gshift  = (channel->strip_type >> 8)  & 0xff;
         int bshift  = (channel->strip_type >> 0)  & 0xff;
@@ -642,9 +655,18 @@ int ws2811_render(ws2811_t *ws2811)
                 ws281x_gamma[(((channel->leds[i] >> rshift) & 0xff) * scale) >> 8], // red
                 ws281x_gamma[(((channel->leds[i] >> gshift) & 0xff) * scale) >> 8], // green
                 ws281x_gamma[(((channel->leds[i] >> bshift) & 0xff) * scale) >> 8], // blue
+                ws281x_gamma[(((channel->leds[i] >> wshift) & 0xff) * scale) >> 8], // white
             };
+            uint8_t array_size = 3; // Assume 3 color LEDs, RGB
 
-            for (j = 0; j < ARRAY_SIZE(color); j++)        // Color
+            // If our shift mask includes the highest nibble, then we have 4
+            // LEDs, RBGW.
+            if (channel->strip_type & SK6812_SHIFT_WMASK)
+            {
+                array_size = 4;
+            }
+
+            for (j = 0; j < array_size; j++)               // Color
             {
                 for (k = 7; k >= 0; k--)                   // Bit
                 {
